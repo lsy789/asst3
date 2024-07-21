@@ -27,6 +27,36 @@ static inline int nextPow2(int n) {
     return n;
 }
 
+__global__ void
+up_sweep(int N, int* device_result, int twod)
+{
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int two_dplus1 = 2*twod;
+
+    device_result[(index+1) * two_dplus1 -1] += device_result[index * two_dplus1 + twod -1];
+}
+
+__global__ void
+down_sweep(int N, int* device_result, int twod)
+{
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+    int two_dplus1 = 2*twod;
+
+    if (((index+1) * two_dplus1 -1) < N) {
+        int tmp = device_result[index*two_dplus1+twod-1];
+        int tmp1 = device_result[(index+1)*two_dplus1-1];
+        device_result[index*two_dplus1+twod-1] = tmp1;
+        device_result[(index+1)*two_dplus1-1] = tmp1 + tmp;
+    }
+    
+}
+
+__global__ void
+zero(int N, int* device_result)
+{
+    device_result[N-1] = 0;
+}
+
 // exclusive_scan --
 //
 // Implementation of an exclusive scan on global memory array `input`,
@@ -53,7 +83,39 @@ void exclusive_scan(int* input, int N, int* result)
     // on the CPU.  Your implementation will need to make multiple calls
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
+    int *tmp = new int[N];
+    int d = N/2;
+    int twod = 1;
+    while (d > THREADS_PER_BLOCK) {
+        int block_size = d / THREADS_PER_BLOCK;
+        up_sweep<<<block_size, THREADS_PER_BLOCK>>>(N, result, twod);
+        d = d / 2;
+        twod = twod * 2;
+    }
 
+    while (d > 0) {
+        up_sweep<<<1, d>>>(N, result, twod);
+        d = d / 2;
+        twod = twod * 2;
+    }
+
+    zero<<<1, 1>>>(N, result);
+
+    // downsweep phase
+    d = 1;
+    twod = N / 2;
+    while (d <= THREADS_PER_BLOCK) {
+         down_sweep<<<1, d>>>(N, result, twod);
+         twod = twod / 2;
+         d = d * 2;
+    }
+
+    while (d < N) {
+        int block_size = d / THREADS_PER_BLOCK;
+        down_sweep<<<block_size, THREADS_PER_BLOCK>>>(N, result, twod);
+        twod = twod / 2;
+        d = d * 2;
+    }
 
 }
 
@@ -69,7 +131,7 @@ double cudaScan(int* inarray, int* end, int* resultarray)
 {
     int* device_result;
     int* device_input;
-    int N = end - inarray;  
+    // int N = end - inarray;  
 
     // This code rounds the arrays provided to exclusive_scan up
     // to a power of 2, but elements after the end of the original
@@ -95,7 +157,7 @@ double cudaScan(int* inarray, int* end, int* resultarray)
 
     double startTime = CycleTimer::currentSeconds();
 
-    exclusive_scan(device_input, N, device_result);
+    exclusive_scan(device_input, rounded_length, device_result);
 
     // Wait for completion
     cudaDeviceSynchronize();
@@ -104,6 +166,8 @@ double cudaScan(int* inarray, int* end, int* resultarray)
     cudaMemcpy(resultarray, device_result, (end - inarray) * sizeof(int), cudaMemcpyDeviceToHost);
 
     double overallDuration = endTime - startTime;
+    cudaFree(device_result);
+    cudaFree(device_input);
     return overallDuration; 
 }
 
@@ -139,6 +203,30 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
     double overallDuration = endTime - startTime;
     return overallDuration; 
 }
+__global__ void
+write_flag(int* device_input, int* device_flag, int* device_index, int N) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (index < N-1 && device_input[index] == device_input[index+1]) {
+        device_flag[index] = 1;
+        device_index[index] = 1;
+    }
+
+    if (index < N-1 && device_input[index] != device_input[index+1]) {
+        device_flag[index] = 0;
+        device_index[index] = 0;
+    }
+
+}
+
+__global__ void
+print_repeat(int* device_index, int* device_flag, int* device_output, int N) {
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (index < N && device_flag[index] == 1) {
+        device_output[device_index[index]] = index;
+    }
+}
 
 
 // find_repeats --
@@ -160,8 +248,29 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // exclusive_scan function with them. However, your implementation
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
+    int *device_flag;
+    int *device_index;
+    int *device_count;
+    int count;
+    int rounded_length = nextPow2(length);
 
-    return 0; 
+    cudaMalloc((void **)&device_flag, rounded_length * sizeof(int));
+    cudaMalloc((void **)&device_index, rounded_length * sizeof(int));
+    cudaMalloc((void **)&device_count, 1 * sizeof(int));
+
+    int block_size = length % THREADS_PER_BLOCK !=0 ? length / THREADS_PER_BLOCK+1 : length / THREADS_PER_BLOCK;
+    write_flag<<<block_size, THREADS_PER_BLOCK>>>(device_input, device_flag, device_index, length);
+
+    exclusive_scan(device_index, rounded_length, device_index);
+
+    print_repeat<<<block_size, THREADS_PER_BLOCK>>>(device_index, device_flag, device_output, length);
+
+    cudaMemcpy(&count, device_index + length -1, 1* sizeof(int), cudaMemcpyDeviceToHost);
+    cudaFree(device_flag);
+    cudaFree(device_index);
+    cudaFree(device_count);
+
+    return count; 
 }
 
 
